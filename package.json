@@ -1,0 +1,12 @@
+{
+  "name": "gaki-archives-stremio",
+  "version": "1.0.0",
+  "description": "Stremio addon for Gaki Archives - Japanese comedy shows",
+  "main": "addon.js",
+  "scripts": {
+    "start": "node addon.js"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
