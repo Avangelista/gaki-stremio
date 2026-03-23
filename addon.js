@@ -5,6 +5,7 @@ const api = require("./lib/api");
 const tmdb = require("./lib/tmdb");
 const tvdb = require("./lib/tvdb");
 const { seriesId, episodeId, parseCategoryId, parseVideoId, formatDuration } = require("./lib/utils");
+const { matchEpisode } = require("./lib/matching");
 
 // Load and validate mappings: categoryId (number) -> external IDs
 const mappingsData = require("./data/mappings.json");
@@ -201,55 +202,12 @@ builder.defineMetaHandler(async ({ type, id }) => {
     const episodeCount = `${deduped.length} episode${deduped.length !== 1 ? "s" : ""} from Gaki Archives`;
 
     const catOverrides = overrides[String(categoryId)];
-    let undatedEpNum = 0;
+    const undatedCounter = { value: 0 };
 
     const episodes = deduped.map((v, i) => {
-        const m = v.title.match(dateRe);
-        let airDate = m ? `${m[1]}-${m[2]}-${m[3]}` : null;
-        let epMatch = airDate ? episodeMap.get(airDate) : null;
-
-        // No date match — try matching by name (e.g. "Absolutely Tasty Takoyaki" -> TVDB "Takoyaki")
-        if (!epMatch && !airDate && episodeMap.size > 0) {
-          const titleLower = v.title.toLowerCase();
-          for (const [date, ep] of episodeMap) {
-            if (ep.name && titleLower.includes(ep.name.toLowerCase())) {
-              epMatch = ep;
-              airDate = date;
-              break;
-            }
-          }
-        }
-
-        // Manual override: maps specific video IDs to season/episode when auto-matching fails
-        const videoOverride = catOverrides?.[String(v.id)];
-        if (!epMatch && videoOverride) {
-          for (const [date, ep] of episodeMap) {
-            if (ep.season === videoOverride.season && ep.episode === videoOverride.episode) {
-              epMatch = ep;
-              airDate = date;
-              break;
-            }
-          }
-        }
-
-        // Parse S__E__ from title (e.g. "Documental - S8E4", "GameCenter CX S05E01")
-        const seMatch = v.title.match(/S(\d{1,2})E(\d{1,2})/i);
-
-        // Determine season/episode number
-        let season, episode;
-        if (epMatch) {
-          season = epMatch.season;
-          episode = epMatch.episode;
-        } else if (videoOverride) {
-          season = videoOverride.season;
-          episode = videoOverride.episode;
-        } else if (seMatch) {
-          season = parseInt(seMatch[1], 10);
-          episode = parseInt(seMatch[2], 10);
-        } else {
-          season = airDate ? 1 : 0;
-          episode = airDate ? (i + 1) : ++undatedEpNum;
-        }
+        const { season, episode, airDate, epMatch } = matchEpisode(
+          v, tmdbEpMap, tvdbEpMap, episodeMap, catOverrides, i, undatedCounter
+        );
 
         return {
           id: episodeId(categoryId, v.id),
