@@ -22,6 +22,8 @@ const tvdbMappings = new Map();
 for (const [catId, tvdbId] of Object.entries(mappingsData.tvdb || {})) {
   tvdbMappings.set(parseInt(catId, 10), tvdbId);
 }
+// Manual video → season/episode overrides for videos that can't be matched automatically
+const overrides = mappingsData.overrides || {};
 
 const CATALOG_PAGE_SIZE = 100; // Max items per catalog page returned to Stremio
 
@@ -198,18 +200,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
     const episodeCount = `${deduped.length} episode${deduped.length !== 1 ? "s" : ""} from Gaki Archives`;
 
-    const meta = {
-      id,
-      type: "series",
-      name,
-      poster: tmdbData?.poster || deduped[0]?.poster_url || await api.getPoster(categoryId),
-      background: tmdbData?.backdrop || undefined,
-      logo: tmdbData?.logo || undefined,
-      description: tmdbData?.overview ? `${tmdbData.overview}\n\n${episodeCount}` : `${name} — ${episodeCount}`,
-      genres: tmdbData?.genres || [],
-      imdbRating: tmdbData?.rating ? String(tmdbData.rating) : undefined,
-      releaseInfo: tmdbData?.firstAired ? tmdbData.firstAired.substring(0, 4) : undefined,
-      videos: deduped.map((v, i) => {
+    const catOverrides = overrides[String(categoryId)];
+    let undatedEpNum = 0;
+
+    const episodes = deduped.map((v, i) => {
         const m = v.title.match(dateRe);
         let airDate = m ? `${m[1]}-${m[2]}-${m[3]}` : null;
         let epMatch = airDate ? episodeMap.get(airDate) : null;
@@ -226,6 +220,18 @@ builder.defineMetaHandler(async ({ type, id }) => {
           }
         }
 
+        // Manual override: maps specific video IDs to season/episode when auto-matching fails
+        const videoOverride = catOverrides?.[String(v.id)];
+        if (!epMatch && videoOverride) {
+          for (const [date, ep] of episodeMap) {
+            if (ep.season === videoOverride.season && ep.episode === videoOverride.episode) {
+              epMatch = ep;
+              airDate = date;
+              break;
+            }
+          }
+        }
+
         // Parse S__E__ from title (e.g. "Documental - S8E4", "GameCenter CX S05E01")
         const seMatch = v.title.match(/S(\d{1,2})E(\d{1,2})/i);
 
@@ -234,12 +240,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
         if (epMatch) {
           season = epMatch.season;
           episode = epMatch.episode;
+        } else if (videoOverride) {
+          season = videoOverride.season;
+          episode = videoOverride.episode;
         } else if (seMatch) {
           season = parseInt(seMatch[1], 10);
           episode = parseInt(seMatch[2], 10);
         } else {
           season = airDate ? 1 : 0;
-          episode = i + 1;
+          episode = airDate ? (i + 1) : ++undatedEpNum;
         }
 
         return {
@@ -251,8 +260,21 @@ builder.defineMetaHandler(async ({ type, id }) => {
           thumbnail: epMatch?.still || v.poster_url || v.thumbnail_url,
           overview: epMatch?.overview || v.description || undefined,
         };
-      }),
-    };
+      });
+
+      const meta = {
+        id,
+        type: "series",
+        name,
+        poster: tmdbData?.poster || deduped[0]?.poster_url || await api.getPoster(categoryId),
+        background: tmdbData?.backdrop || undefined,
+        logo: tmdbData?.logo || undefined,
+        description: tmdbData?.overview ? `${tmdbData.overview}\n\n${episodeCount}` : `${name} — ${episodeCount}`,
+        genres: tmdbData?.genres || [],
+        imdbRating: tmdbData?.rating ? String(tmdbData.rating) : undefined,
+        releaseInfo: tmdbData?.firstAired ? tmdbData.firstAired.substring(0, 4) : undefined,
+        videos: episodes,
+      };
 
     return { meta };
   } catch (err) {
