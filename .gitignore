@@ -1,4 +1,4 @@
 node_modules/
 .claude/
 archive/
-node_modules
+.env

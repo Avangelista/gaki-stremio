@@ -1,6 +1,21 @@
+require("dotenv").config();
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const api = require("./lib/api");
+const tmdb = require("./lib/tmdb");
 const { seriesId, episodeId, parseCategoryId, parseVideoId, formatDuration } = require("./lib/utils");
+
+// Load TMDB mappings: categoryId (number) -> tmdbId
+const mappingsData = require("./data/mappings.json");
+const tmdbMappings = new Map();
+for (const [catId, tmdbId] of Object.entries(mappingsData.tmdb)) {
+  tmdbMappings.set(parseInt(catId, 10), tmdbId);
+}
+
+async function getTmdbForCategory(categoryId) {
+  const tmdbId = tmdbMappings.get(categoryId);
+  if (!tmdbId) return null;
+  return tmdb.getShowDetails(tmdbId);
+}
 
 const manifest = {
   id: "com.gakiarchives.stremio",
@@ -35,43 +50,53 @@ const builder = new addonBuilder(manifest);
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
   if (type !== "series" || id !== "gaki_archives") return { metas: [] };
 
-  await api.warmPosters();
+  try {
+    if (extra.search) {
+      const videos = await api.searchVideos(extra.search);
 
-  if (extra.search) {
-    const videos = await api.searchVideos(extra.search);
-    const categories = await api.getCategories();
-    const catMap = new Map(categories.map((c) => [c.id, c.name]));
-
-    // Deduplicate by category, keep first match's poster
-    const seen = new Map();
-    for (const v of videos) {
-      if (!seen.has(v.category_id)) {
-        seen.set(v.category_id, v);
+      // Deduplicate by category, keep first match's poster
+      const seen = new Map();
+      for (const v of videos) {
+        if (!seen.has(v.category_id)) {
+          seen.set(v.category_id, v);
+        }
       }
+
+      const catIds = [...seen.keys()];
+      const [tmdbDetails, posters] = await Promise.all([
+        Promise.all(catIds.map(getTmdbForCategory)),
+        Promise.all(catIds.map((id) => api.getPoster(id))),
+      ]);
+      const metas = catIds.map((catId, i) => ({
+        id: seriesId(catId),
+        type: "series",
+        name: api.getCategoryName(catId),
+        poster: tmdbDetails[i]?.poster || seen.get(catId).poster_url || posters[i],
+      }));
+      return { metas };
     }
 
-    const metas = [...seen.entries()].map(([catId, video]) => ({
-      id: seriesId(catId),
+    // Browse mode
+    const categories = api.getCategories();
+    const skip = parseInt(extra.skip) || 0;
+    const page = categories.slice(skip, skip + 100);
+
+    const [tmdbDetails, posters] = await Promise.all([
+      Promise.all(page.map((cat) => getTmdbForCategory(cat.id))),
+      Promise.all(page.map((cat) => api.getPoster(cat.id))),
+    ]);
+    const metas = page.map((cat, i) => ({
+      id: seriesId(cat.id),
       type: "series",
-      name: catMap.get(catId) || `Category ${catId}`,
-      poster: video.poster_url || api.getPoster(catId),
+      name: cat.name,
+      poster: tmdbDetails[i]?.poster || posters[i],
     }));
+
     return { metas };
+  } catch (err) {
+    console.error("Catalog handler error:", err.message);
+    return { metas: [] };
   }
-
-  // Browse mode
-  const categories = await api.getCategories();
-  const skip = parseInt(extra.skip) || 0;
-  const page = categories.slice(skip, skip + 100);
-
-  const metas = page.map((cat) => ({
-    id: seriesId(cat.id),
-    type: "series",
-    name: cat.name,
-    poster: api.getPoster(cat.id),
-  }));
-
-  return { metas };
 });
 
 // --- Meta Handler ---
@@ -81,33 +106,94 @@ builder.defineMetaHandler(async ({ type, id }) => {
   const categoryId = parseCategoryId(id);
   if (!categoryId) return { meta: null };
 
-  const [categories, videos] = await Promise.all([
-    api.getCategories(),
-    api.getVideosByCategory(categoryId),
-  ]);
+  try {
+    const tmdbId = tmdbMappings.get(categoryId);
+    const [videos, tmdbData, episodeMap] = await Promise.all([
+      api.getVideosByCategory(categoryId),
+      getTmdbForCategory(categoryId),
+      tmdbId ? tmdb.getEpisodesByDate(tmdbId) : Promise.resolve(new Map()),
+    ]);
 
-  const category = categories.find((c) => c.id === categoryId);
-  const name = category ? category.name : `Category ${categoryId}`;
+    const name = api.getCategoryName(categoryId);
 
-  const meta = {
-    id,
-    type: "series",
-    name,
-    poster: videos[0]?.poster_url || api.getPoster(categoryId),
-    background: videos[0]?.poster_url || api.getPoster(categoryId),
-    description: `${name} — ${videos.length} episode${videos.length !== 1 ? "s" : ""} from Gaki Archives`,
-    videos: videos.map((v, i) => ({
-      id: episodeId(categoryId, v.id),
-      title: v.title,
-      season: 1,
-      episode: i + 1,
-      released: new Date(v.created_at).toISOString(),
-      thumbnail: v.thumbnail_url,
-      overview: v.description || formatDuration(v.duration_seconds),
-    })),
-  };
+    // Deduplicate videos with the same air date — keep highest ID (newest upload)
+    const dateRe = /(\d{4})[.-](\d{2})[.-](\d{2})/;
+    const seenDates = new Map();
+    const deduped = [];
+    for (const v of videos) {
+      const m = v.title.match(dateRe);
+      const airDate = m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+      if (airDate && seenDates.has(airDate)) {
+        const { index } = seenDates.get(airDate);
+        if (v.id > deduped[index].id) {
+          deduped[index] = v;
+          seenDates.set(airDate, { index });
+        }
+      } else {
+        if (airDate) seenDates.set(airDate, { index: deduped.length });
+        deduped.push(v);
+      }
+    }
 
-  return { meta };
+    const episodeCount = `${deduped.length} episode${deduped.length !== 1 ? "s" : ""} from Gaki Archives`;
+
+    const meta = {
+      id,
+      type: "series",
+      name,
+      poster: tmdbData?.poster || deduped[0]?.poster_url || await api.getPoster(categoryId),
+      background: tmdbData?.backdrop || undefined,
+      logo: tmdbData?.logo || undefined,
+      description: tmdbData?.overview ? `${tmdbData.overview}\n\n${episodeCount}` : `${name} — ${episodeCount}`,
+      genres: tmdbData?.genres || [],
+      imdbRating: tmdbData?.rating ? String(tmdbData.rating) : undefined,
+      releaseInfo: tmdbData?.firstAired ? tmdbData.firstAired.substring(0, 4) : undefined,
+      videos: deduped.map((v, i) => {
+        const m = v.title.match(dateRe);
+        let airDate = m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+        let tmdbEp = airDate ? episodeMap.get(airDate) : null;
+
+        // No date in title — only try fuzzy matching for full-length episodes (>=30min) with enough keywords
+        if (!tmdbEp && episodeMap.size > 0 && v.duration_seconds >= 1800) {
+          const stopWords = new Set(["wednesday", "downtown", "part", "with", "that", "this", "from", "have", "will", "been", "than", "they", "their", "what", "when", "which", "about", "would", "could", "episode", "theory", "special"]);
+          const titleLower = v.title.toLowerCase();
+          const words = titleLower.split(/[\s\-:,#]+/)
+            .filter((w) => w.length > 3 && !stopWords.has(w) && !/^\d+$/.test(w));
+          if (words.length >= 3) {
+            let bestMatch = null;
+            let bestScore = 0;
+            for (const [date, ep] of episodeMap) {
+              const haystack = `${ep.name} ${ep.overview}`.toLowerCase();
+              const score = words.filter((w) => haystack.includes(w)).length;
+              if (score > bestScore && score >= 3) {
+                bestScore = score;
+                bestMatch = { date, ep };
+              }
+            }
+            if (bestMatch) {
+              airDate = bestMatch.date;
+              tmdbEp = bestMatch.ep;
+            }
+          }
+        }
+
+        return {
+          id: episodeId(categoryId, v.id),
+          title: v.title,
+          season: tmdbEp ? tmdbEp.season : (airDate ? 1 : 0),
+          episode: tmdbEp ? tmdbEp.episode : i + 1,
+          released: airDate ? new Date(airDate).toISOString() : undefined,
+          thumbnail: tmdbEp?.still || v.poster_url || v.thumbnail_url,
+          overview: tmdbEp?.overview || v.description || formatDuration(v.duration_seconds),
+        };
+      }),
+    };
+
+    return { meta };
+  } catch (err) {
+    console.error("Meta handler error:", err.message);
+    return { meta: null };
+  }
 });
 
 // --- Stream Handler ---
@@ -118,23 +204,30 @@ builder.defineStreamHandler(async ({ type, id }) => {
   const videoId = parseVideoId(id);
   if (!categoryId || !videoId) return { streams: [] };
 
-  const videos = await api.getVideosByCategory(categoryId);
-  const video = videos.find((v) => v.id === videoId);
-  if (!video || !video.video_url) return { streams: [] };
+  try {
+    const videos = await api.getVideosByCategory(categoryId);
+    const video = videos.find((v) => v.id === videoId);
+    if (!video) return { streams: [] };
 
-  return {
-    streams: [
-      {
-        url: video.video_url,
-        name: "Gaki Archives",
-        description: `${video.title}${video.duration_seconds ? " • " + formatDuration(video.duration_seconds) : ""}`,
-        behaviorHints: {
-          notWebReady: true,
-          bingeGroup: `gaki_cat_${categoryId}`,
+    const streamUrl = `https://videos.gakiarchives.com/${video.id}.m3u8`;
+
+    return {
+      streams: [
+        {
+          url: streamUrl,
+          name: "Gaki Archives",
+          description: `${video.title}${video.duration_seconds ? " • " + formatDuration(video.duration_seconds) : ""}`,
+          behaviorHints: {
+            notWebReady: true,
+            bingeGroup: `gaki_cat_${categoryId}`,
+          },
         },
-      },
-    ],
-  };
+      ],
+    };
+  } catch (err) {
+    console.error("Stream handler error:", err.message);
+    return { streams: [] };
+  }
 });
 
 const port = process.env.PORT || 7000;
